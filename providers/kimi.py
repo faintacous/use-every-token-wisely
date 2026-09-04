@@ -411,13 +411,29 @@ class KimiProvider(BaseProvider):
 
     @staticmethod
     def _count_window(label: str, detail: dict) -> WindowStats | None:
-        """Build a WindowStats from a {limit, used, remaining, resetTime} dict."""
+        """Build a WindowStats from a {limit, used?, remaining?, resetTime} dict.
+
+        The API returns either ``used`` or ``remaining`` — compute whichever
+        is missing from the limit.
+        """
         try:
             limit = int(detail.get("limit") or 0)
-            used = int(detail.get("used") or 0)
         except (TypeError, ValueError):
             return None
         if limit <= 0:
+            return None
+        if detail.get("used") is not None:
+            try:
+                used = int(detail.get("used") or 0)
+            except (TypeError, ValueError):
+                return None
+        elif detail.get("remaining") is not None:
+            try:
+                remaining = int(detail.get("remaining") or 0)
+            except (TypeError, ValueError):
+                return None
+            used = max(0, limit - remaining)
+        else:
             return None
         return WindowStats(
             label=label,
@@ -450,6 +466,24 @@ class KimiProvider(BaseProvider):
 
     def _build_cli_usage(self, payload: dict) -> UsageData:
         data = UsageData(service="Kimi")
+
+        # Weekly quota (request count) → 7d bar (used = limit - remaining).
+        weekly = payload.get("usage") or {}
+        w7 = self._count_window("7d", weekly)
+        if w7:
+            data.window_7d = w7
+
+        # Short rate-limit window (300 minutes = 5h).
+        for entry in payload.get("limits") or []:
+            window = entry.get("window") or {}
+            if (
+                window.get("duration") == 300
+                and window.get("timeUnit") == "TIME_UNIT_MINUTE"
+            ):
+                w5 = self._count_window("5h", entry.get("detail") or {})
+                if w5:
+                    data.window_5h = w5
+                break
 
         # Membership tier, e.g. "LEVEL_INTERMEDIATE" → "Intermediate".
         level = ((payload.get("user") or {}).get("membership") or {}).get("level", "")
