@@ -367,14 +367,22 @@ class KimiProvider(BaseProvider):
     # ------------------------------------------------------------------
 
     def _load_desktop_token(self) -> tuple[str | None, str | None]:
-        """Return (access_token, device_id) from the desktop app's files."""
+        """Return (access_token, device_id) from the desktop app's files.
+
+        The desktop app recently started encrypting its token store with
+        Electron's safeStorage (Chromium os_crypt: DPAPI + AES-256-GCM).
+        We handle both the legacy plaintext and the encrypted format.
+        """
         if not DESKTOP_TOKEN_PATH.exists():
             return None, None
         try:
             store = json.loads(DESKTOP_TOKEN_PATH.read_text(encoding="utf-8"))
-            token = store.get("tokens", {}).get("access_token")
         except (json.JSONDecodeError, OSError):
-            token = None
+            return None, None
+
+        token = store.get("tokens", {}).get("access_token")
+        if not token and store.get("encryption") == "safeStorage.v1":
+            token = self._decrypt_safe_storage(store.get("data"))
 
         device_id = None
         if DESKTOP_IDENTITY_PATH.exists():
@@ -385,6 +393,66 @@ class KimiProvider(BaseProvider):
             except (json.JSONDecodeError, OSError):
                 pass
         return token, device_id
+
+    @staticmethod
+    def _decrypt_safe_storage(enc_b64: str) -> str | None:
+        """Decrypt an Electron safeStorage v10 blob (Windows).
+
+        Same mechanism as Chromium os_crypt: the AES-256 key is wrapped by
+        Windows DPAPI in the app's Local State; the blob itself is
+        'v10' + 12-byte nonce + ciphertext + 16-byte GCM tag.
+        """
+        if sys.platform != "win32" or not enc_b64:
+            return None
+        try:
+            import base64
+            import ctypes
+            import ctypes.wintypes
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+            app_dir = DESKTOP_TOKEN_PATH.parent.parent
+            ls = json.loads(
+                (app_dir / "Local State").read_text(encoding="utf-8")
+            )
+            key_b64 = ls.get("os_crypt", {}).get("encrypted_key", "")
+            if not key_b64:
+                return None
+            enc_key = base64.b64decode(key_b64)
+            if not enc_key.startswith(b"DPAPI"):
+                return None
+
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [
+                    ("cbData", ctypes.wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char)),
+                ]
+
+            blob_in = DATA_BLOB(
+                len(enc_key) - 5,
+                ctypes.cast(
+                    ctypes.create_string_buffer(enc_key[5:], len(enc_key) - 5),
+                    ctypes.POINTER(ctypes.c_char),
+                ),
+            )
+            blob_out = DATA_BLOB()
+            if not ctypes.windll.crypt32.CryptUnprotectData(
+                ctypes.byref(blob_in), None, None, None, None, 0,
+                ctypes.byref(blob_out),
+            ):
+                return None
+            aes_key = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+            blob = base64.b64decode(enc_b64)
+            if not blob.startswith(b"v10"):
+                return None
+            nonce = blob[3:15]
+            ciphertext = blob[15:]
+            plaintext = AESGCM(aes_key).decrypt(nonce, ciphertext, None)
+            store = json.loads(plaintext.decode("utf-8"))
+            return store.get("tokens", {}).get("access_token")
+        except Exception:
+            return None
 
     def _fetch_desktop_stats(self) -> dict | None:
         token, device_id = self._load_desktop_token()
@@ -507,8 +575,9 @@ class KimiProvider(BaseProvider):
             )
             window_pct = 100.0 if is_exhausted else 0.0
 
+            # Only add desktop 5h/7d if the CLI didn't already fill them.
             rl5h = desktop.get("ratelimitCode5h") or {}
-            if rl5h.get("enabled"):
+            if rl5h.get("enabled") and data.window_5h.reset_at is None:
                 data.extra_windows.append(WindowStats(
                     label="5h",
                     percent=window_pct,
@@ -516,7 +585,7 @@ class KimiProvider(BaseProvider):
                     is_real_limit=is_exhausted,
                 ))
             rl7d = desktop.get("ratelimitCode7d") or {}
-            if rl7d.get("enabled"):
+            if rl7d.get("enabled") and data.window_7d.reset_at is None:
                 data.extra_windows.append(WindowStats(
                     label="7d",
                     percent=window_pct,
